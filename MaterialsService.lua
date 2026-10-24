@@ -9,7 +9,7 @@ if M.preview then
 	local function copy(v) return v and Http:JSONDecode(Http:JSONEncode(v)) end
 	Store={GetAsync=function(_,k)return copy(memory[k]) end,UpdateAsync=function(_,k,fn)memory[k]=fn(copy(memory[k]));return copy(memory[k]) end}
 end
-local cache,external,busy,last={},{},{},{}
+local cache,busy,last={},{},{}
 local function fail(s)error(s,0) end
 local function clean(v,max,optional)
 	if optional and (v==nil or v=="") then return "" end
@@ -43,13 +43,12 @@ end
 function M.configured()return (not M.preview or Config.AllowStudioBackend==true) and Config.BackendURL:match("^https://[^/]+$")~=nil end
 local function backend(p,path,payload)
 	if not M.configured() then fail("PDF uploads are not connected yet. Pasted notes are available.") end
-	payload.userId=tostring(p.UserId)
-	local ok,r=pcall(function()return Http:RequestAsync({Url=Config.BackendURL.."/v1/game/"..path,Method="POST",Headers={["Content-Type"]="application/json",["X-StudyMate-Key"]=Http:GetSecret(Config.SecretName),["X-Universe-Id"]=tostring(game.GameId)},Body=Http:JSONEncode(payload)})end)
+	local ok,r=pcall(function()return Http:RequestAsync({Url=Config.BackendURL.."/v1/game/"..path,Method="POST",Headers={["Content-Type"]="application/json"},Body=Http:JSONEncode(payload)})end)
 	if not ok or type(r.Body)~="string" or #r.Body>180000 then fail("PDF service unavailable. Try again later.") end
 	if not r.Success then
 		local messages={
 			[400]="Check the import code, title, and selected course.",
-			[404]="PDF or import code not found. The code may have expired or already been used.",
+			[404]="Code expired or upload service restarted. Upload the PDF again.",
 			[409]="Your PDF library is full. Delete a PDF and try again.",
 			[429]="Too many requests. Please wait and try again.",
 		}
@@ -63,19 +62,13 @@ local function view(p,data,status)
 	local out={courses={},documents={},preview=M.preview,pdfConfigured=M.configured(),status=status or (M.preview and "Saved for this Studio test session" or "Saved")}
 	for _,c in ipairs(data.courses)do table.insert(out.courses,{id=c.id,title=filter(p,c.title),number=filter(p,c.number)})end
 	local docs=table.clone(data.documents)
-	for _,d in ipairs(external[p] or {})do if find(data.courses,d.courseId)then table.insert(docs,d)end end
 	for _,d in ipairs(docs)do table.insert(out.documents,{id=d.id,courseId=d.courseId,lecture=filter(p,d.lecture),unit=filter(p,d.unit),chapter=filter(p,d.chapter),kind=d.kind,category=d.kind=="notes" and "notes" or (d.category=="exam" and "exam" or "lecture"),status=d.status or "ready"})end
 	return out
 end
 local function dispatch(p,action,a)
 	local data=action=="List" and load(p) or cache[p] or load(p)
 	if action=="List" then
-		local status
-		if M.configured() then
-			local ok,r=pcall(backend,p,"library",{courses=data.courses})
-			if ok then external[p]=r.documents or {};status="PDFs refreshed" else external[p]={};status="PDF service unavailable; your notes are still here" end
-		end
-		return view(p,data,status)
+		return view(p,data)
 	elseif action=="CreateCourse" then
 		local c={id=Http:GenerateGUID(false),number=clean(a.number,32),title=clean(a.title,100)}
 		data=update(p,function(d)if #d.courses>=Config.MaxCourses then fail("Course limit")end;table.insert(d.courses,c)end)
@@ -100,27 +93,39 @@ local function dispatch(p,action,a)
 		local code=clean(a.code,40):upper():gsub("[%s%-]","")
 		if #code~=32 or code:find("[^A-F0-9]") then fail("Paste the complete PDF import code.") end
 		if a.category~="lecture" and a.category~="exam" then fail("Choose a PDF category.") end
-		backend(p,"import",{courseId=cid,code=code,category=a.category,lecture=clean(a.lecture,100),unit=clean(a.unit,80,true),chapter=clean(a.chapter,80,true)})
-		local synced,library=pcall(backend,p,"library",{})
-		if synced then external[p]=library.documents or {} end
-		return view(p,data,synced and "PDF imported into your course" or "PDF imported. Refresh to see it.")
-	elseif action=="ReadPDF" then
-		local id=clean(a.id,80)
-		local doc=find(external[p] or {},id)
-		if not doc or not find(data.courses,doc.courseId) then fail("Refresh PDFs and try again.") end
-		local page=a.page or 1
-		if type(page)~="number" or page%1~=0 or page<1 or page>100 then fail("Invalid text section.") end
-		local r=backend(p,"read",{documentId=id,page=page})
-		if type(r.text)~="string" or #r.text>8000 or type(r.pageCount)~="number" or r.pageCount<1 or r.pageCount>100 then fail("Invalid PDF text response.") end
-		return {pdf={id=id,lecture=filter(p,r.lecture),text=filter(p,r.text),page=page,pageCount=r.pageCount},status="PDF text — section "..page.." of "..r.pageCount}
+        local lecture=clean(a.lecture,100)
+        local unit=clean(a.unit,80,true);local chapter=clean(a.chapter,80,true)
+        local id="pdf-"..code
+        if find(data.documents,id) then return view(p,data,"This PDF is already in your library") end
+        local r=backend(p,"import",{code=code})
+        local text=clean(r.text,Config.MaxPdfBytes or 120000)
+        local doc={id=id,courseId=cid,kind="pdf",category=a.category,lecture=lecture,unit=unit,chapter=chapter,text=text,status="ready"}
+        data=update(p,function(d)
+            if not find(d.courses,cid) then fail("Course not found") end
+            if find(d.documents,id) then return end
+            if #d.documents>=Config.MaxDocuments then fail("Document limit") end
+            table.insert(d.documents,doc)
+        end)
+        return view(p,data,M.preview and "PDF imported for this Studio session" or "PDF saved in your Roblox library")
+    elseif action=="ReadPDF" then
+        local id=clean(a.id,80)
+        local doc=find(data.documents,id)
+        if not doc or doc.kind~="pdf" then fail("PDF not found in your library") end
+        local page=a.page or 1
+        local characters=utf8.len(doc.text)
+        if not characters then fail("Invalid saved PDF text") end
+        local count=math.max(1,math.ceil(characters/1100))
+        if type(page)~="number" or page%1~=0 or page<1 or page>count then fail("Invalid text section") end
+        local first=utf8.offset(doc.text,(page-1)*1100+1)
+        local after=utf8.offset(doc.text,math.min(page*1100+1,characters+1)) or (#doc.text+1)
+        local text=doc.text:sub(first,after-1)
+        return {pdf={id=id,lecture=filter(p,doc.lecture),text=filter(p,text),page=page,pageCount=count},status="PDF text — section "..page.." of "..count}
 	elseif action=="DeleteDocument" then
 		local id=clean(a.id,80);local d=find(data.documents,id)
-		if not d then d=find(external[p] or {},id);if not d then fail("Document not found")end;backend(p,"delete",{documentId=id})end
+		if not d then fail("Document not found") end
 		data=update(p,function(v)for i=#v.documents,1,-1 do if v.documents[i].id==id then table.remove(v.documents,i)end end end)
-		for i=#(external[p] or {}),1,-1 do if external[p][i].id==id then table.remove(external[p],i)end end
 	elseif action=="DeleteCourse" then
 		local id=clean(a.id,80);if not find(data.courses,id)then fail("Course not found")end
-		if M.configured()then backend(p,"delete-course",{courseId=id})end
 		data=update(p,function(v)
 			for i=#v.courses,1,-1 do if v.courses[i].id==id then table.remove(v.courses,i)end end
 			for i=#v.documents,1,-1 do if v.documents[i].courseId==id then table.remove(v.documents,i)end end
@@ -137,7 +142,7 @@ function M.init()
 		busy[p]=true;last[p]=os.clock();local ok,r=pcall(dispatch,p,action,a);busy[p]=nil
 		return ok and {ok=true,data=r} or {ok=false,error=tostring(r):sub(1,220)}
 	end
-	game.Players.PlayerRemoving:Connect(function(p)cache[p]=nil;external[p]=nil;busy[p]=nil;last[p]=nil end)
+	game.Players.PlayerRemoving:Connect(function(p)cache[p]=nil;busy[p]=nil;last[p]=nil end)
 end
 return M
 

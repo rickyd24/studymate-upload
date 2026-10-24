@@ -18,6 +18,8 @@ def extract(raw):
             raise ValueError('Split this PDF into smaller files (120,000 characters maximum).')
         pages.append(text)
     text = '\n\n'.join(pages).strip()
+    if len(text.encode('utf-8')) > 120000 or len(json.dumps({'text':text},ensure_ascii=False).encode('utf-8')) > 170000:
+        raise ValueError('Split this PDF into smaller files (120 KB of extracted text maximum).')
     if not text:
         raise ValueError('No selectable text found. Scanned PDFs need OCR before upload.')
     return {'text': text, 'pages': len(pages)}

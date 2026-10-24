@@ -88,10 +88,10 @@ function M.init(options)
 			end
 			label(tab=="Practice Exams" and "Your practice exam PDFs" or "Your lecture slide PDFs")
 			if not data.pdfConfigured then
-				label("PDF uploads aren't connected yet. The upload service needs to be set up; you can paste notes now.")
+				label("PDF importing is unavailable in this session. Your saved PDFs and pasted notes remain accessible.")
 			else
 				label("Import PDF")
-				label("Paste your one-use import code. Codes expire after 15 minutes.")
+				label("Paste your private import code. Codes expire after 15 minutes or a service restart.")
 				local code=field("PDF import code")
 				local name=field("Lecture / practice exam title")
 				local unit=field("Unit (optional)")

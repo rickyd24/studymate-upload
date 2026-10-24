@@ -1,5 +1,5 @@
-"""StudyMate private PDF text library. Run behind HTTPS with one persistent disk."""
-import hashlib, hmac, json, os, re, secrets, sqlite3, subprocess, sys, time, threading
+"""Temporary PDF conversion service. Saved libraries live in Roblox DataStore."""
+import hashlib, json, os, re, secrets, sqlite3, subprocess, sys, time, threading
 from pathlib import Path
 from urllib.parse import urlsplit
 from contextlib import contextmanager
@@ -18,16 +18,13 @@ def need(value, limit=100):
     return value.strip()
 
 class Service:
-    def __init__(self, db_path, key, universe, origin, clock=time.time):
-        if len(key) < 32: raise ValueError('STUDYMATE_KEY must contain at least 32 characters.')
-        self.db_path, self.key, self.universe, self.origin, self.clock = str(db_path), key, str(universe), origin.rstrip('/'), clock
+    def __init__(self, db_path, origin, clock=time.time):
+        self.db_path, self.origin, self.clock = str(db_path), origin.rstrip('/'), clock
         self.parser_slot = threading.BoundedSemaphore(1)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         with self.db() as db:
             db.executescript('''
             CREATE TABLE IF NOT EXISTS pending (hash TEXT PRIMARY KEY, text TEXT NOT NULL, pages INTEGER NOT NULL, expires INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, user TEXT NOT NULL, course TEXT NOT NULL, lecture TEXT NOT NULL, unit TEXT NOT NULL, chapter TEXT NOT NULL, category TEXT NOT NULL, text TEXT NOT NULL, pages INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS owner ON documents(user,course);
             CREATE TABLE IF NOT EXISTS limits (bucket TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
             ''')
     @contextmanager
@@ -64,44 +61,15 @@ class Service:
         if result.returncode or 'error' in parsed:
             raise Problem(422, parsed.get('error', 'The PDF could not be read.'))
         return parsed
-    def game(self, action, data):
-        user = need(data.get('userId'), 24)
-        if not re.fullmatch(r'[1-9][0-9]*', user): raise Problem(400, 'Invalid player.')
-        self.rate('player:'+user, 120, 60)
+    def import_text(self, data):
+        code = need(data.get('code'), 40).upper().replace('-', '').replace(' ', '')
+        if not re.fullmatch('[A-F0-9]{32}', code): raise Problem(400, 'Check your import code.')
         with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            if action == 'import':
-                course = need(data.get('courseId'), 80)
-                code = need(data.get('code'), 40).upper().replace('-', '').replace(' ', '')
-                if not re.fullmatch('[A-F0-9]{32}', code): raise Problem(400, 'Check your import code.')
-                row = db.execute('SELECT * FROM pending WHERE hash=? AND expires>?', (digest(code), self.clock())).fetchone()
-                if not row: raise Problem(404, 'Import code expired or already used. Upload the PDF again.')
-                count, size = db.execute('SELECT count(*),coalesce(sum(length(CAST(text AS BLOB))),0) FROM documents WHERE user=?', (user,)).fetchone()
-                if count >= 60 or size+len(row['text'].encode()) > 2_000_000:
-                    raise Problem(409, 'PDF library full. Delete a PDF before importing another.')
-                category = data.get('category')
-                if category not in ('lecture','exam'): raise Problem(400, 'Choose lecture or practice exam.')
-                document_id = 'pdf-'+secrets.token_hex(16)
-                db.execute('INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?)', (document_id,user,course,need(data.get('lecture'),100),need(data.get('unit'),80) if data.get('unit') else '',need(data.get('chapter'),80) if data.get('chapter') else '',category,row['text'],row['pages']))
-                db.execute('DELETE FROM pending WHERE hash=?', (digest(code),))
-                return {'documentId':document_id}
-            if action == 'library':
-                rows = db.execute('SELECT * FROM documents WHERE user=? ORDER BY rowid DESC', (user,)).fetchall()
-                return {'documents':[{'id':r['id'],'courseId':r['course'],'lecture':r['lecture'],'unit':r['unit'],'chapter':r['chapter'],'category':r['category'],'kind':'pdf','status':'ready','pages':r['pages']} for r in rows]}
-            if action == 'read':
-                row = db.execute('SELECT * FROM documents WHERE user=? AND id=?', (user,need(data.get('documentId'),80))).fetchone()
-                if not row: raise Problem(404, 'PDF not found.')
-                page = data.get('page',1)
-                chunks = [row['text'][i:i+1500] for i in range(0,len(row['text']),1500)]
-                if type(page) is not int or not 1<=page<=len(chunks): raise Problem(400,'Invalid text section.')
-                return {'text':chunks[page-1],'page':page,'pageCount':len(chunks),'lecture':row['lecture']}
-            if action == 'delete':
-                db.execute('DELETE FROM documents WHERE user=? AND id=?',(user,need(data.get('documentId'),80)))
-                return {'ok':True}
-            if action == 'delete-course':
-                db.execute('DELETE FROM documents WHERE user=? AND course=?',(user,need(data.get('courseId'),80)))
-                return {'ok':True}
-        raise Problem(404,'Unknown action.')
+            row = db.execute('SELECT * FROM pending WHERE hash=? AND expires>?', (digest(code), self.clock())).fetchone()
+            if not row: raise Problem(404, 'Code expired or service restarted. Upload the PDF again.')
+            # Retry-safe: Roblox may need to retry after a DataStore or network failure.
+            # The code itself is the 128-bit bearer credential; no player IDs are accepted.
+            return {'text':row['text'],'pages':row['pages']}
     def __call__(self, env, start):
         status, mime = 200, 'application/json; charset=utf-8'
         try:
@@ -129,14 +97,13 @@ class Service:
                     if count>=500: raise Problem(503,'Uploads are busy. Try again shortly.')
                     db.execute('INSERT INTO pending VALUES (?,?,?,?)',(digest(code),parsed['text'],parsed['pages'],int(self.clock())+TTL))
                 body = json.dumps({'code':'-'.join(code[i:i+8] for i in range(0,32,8)),'expiresIn':TTL,'pages':parsed['pages']}).encode()
-            elif method == 'POST' and path.startswith('/v1/game/'):
-                if not hmac.compare_digest(env.get('HTTP_X_STUDYMATE_KEY',''),self.key) or env.get('HTTP_X_UNIVERSE_ID')!=self.universe:
-                    raise Problem(401,'Unauthorized.')
+            elif method == 'POST' and path == '/v1/game/import':
+                self.rate('imports', 1200, 60)
                 length = int(env.get('CONTENT_LENGTH') or 0)
-                if not 0<length<=30000: raise Problem(413,'Request too large.')
+                if not 0<length<=200: raise Problem(413,'Request too large.')
                 data = json.loads(env['wsgi.input'].read(length))
                 if not isinstance(data,dict): raise Problem(400,'Invalid request.')
-                body = json.dumps(self.game(path.rsplit('/',1)[-1],data)).encode()
+                body = json.dumps(self.import_text(data),ensure_ascii=False).encode()
             else: raise Problem(404,'Not found.')
         except Problem as exc:
             status, body = exc.status, json.dumps({'error':exc.message}).encode()
@@ -152,7 +119,7 @@ def create_app():
     origin = (os.environ.get('PUBLIC_ORIGIN') or os.environ.get('RENDER_EXTERNAL_URL') or '').rstrip('/')
     if urlsplit(origin).scheme != 'https' and not origin.startswith('http://127.0.0.1:'):
         raise ValueError('PUBLIC_ORIGIN must use HTTPS.')
-    return Service(os.environ.get('DATABASE_PATH','data/materials.sqlite3'),os.environ['STUDYMATE_KEY'],os.environ['ROBLOX_UNIVERSE_ID'],origin)
+    return Service(os.environ.get('DATABASE_PATH','data/materials.sqlite3'),origin)
 
 if __name__ == '__main__':
     from wsgiref.simple_server import make_server
