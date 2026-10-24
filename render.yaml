@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: studymate-upload
+    runtime: python
+    plan: 0.5c-512mb
+    region: virginia
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn 'app:create_app()' --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 45 --access-logfile -
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    disk:
+      name: studymate-library
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: ROBLOX_UNIVERSE_ID
+        value: '10772638166'
+      - key: DATABASE_PATH
+        value: /var/data/materials.sqlite3
+      - key: STUDYMATE_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: '3.12.12'

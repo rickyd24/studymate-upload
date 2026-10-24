@@ -1,0 +1,10 @@
+__pycache__/
+data/
+*.sqlite3*
+.env
+.venv/
+*.original.lua
+preview.py
+sample.pdf
+render-schema.json
+validation-deps/

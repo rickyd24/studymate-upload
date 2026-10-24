@@ -1,0 +1,2 @@
+pypdf>=6.0,<7
+gunicorn>=23,<24; sys_platform != 'win32'
